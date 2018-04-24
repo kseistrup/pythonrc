@@ -70,6 +70,7 @@ import imp
 import importlib
 import inspect
 import keyword
+import linecache
 import os
 import pkgutil
 import pprint
@@ -79,11 +80,13 @@ import rlcompleter
 import shlex
 import signal
 import subprocess
+import time
+import types
 import webbrowser
 
 from code import InteractiveConsole
 from collections import namedtuple
-from functools import partial
+from functools import partial, wraps
 from tempfile import NamedTemporaryFile
 
 
@@ -101,12 +104,100 @@ config = dict(
     DOC_URL  = "https://docs.python.org/{sys.version_info.major}/search.html?q={term}",
     HELP_CMD = '\h',
     LIST_CMD = '\l',
+    TRACE_CMD = '\T',
     VENV_RC  = ".venv_rc.py",
     # - option to pass to the editor to open a file at a specific
     # `line_no`. This is used when the EDIT_CMD is invoked with a python
     # object to open the source file for the object.
     LINE_NUM_OPT = "+{line_no}",
 )
+
+
+class Tracer(object):
+    """A class decorator for enabling tracing on the decorated function
+    """
+    def __init__(self, function):
+        self.indent = ''
+        self.function = function
+        self.fmt = '{msec:.6f} {filename:30} +{lineno:<5} |{indent}{src_code}\n'
+
+    def is_ignored(self, filename):
+        """ is_ignored(filename) -> True or False
+
+        Are calls within this filename skipped during a trace ?
+        """
+        system_path = os.path.dirname(sys.modules['os'].__file__)
+        return True if (                                        # skip over
+                os.path.dirname(filename) == system_path or     # - system modules
+                filename.startswith('<')                 or     # - builtins like <string>
+                __file__.find(filename) != -1                   # - /this/ module
+                ) else False
+
+    def trace_fn(self, frame, event, arg):
+        """ trace_fn(frame, event, arg) -> trace_fn
+
+        The tracing function that'll be set using the ``sys.settrace()`` call.
+        """
+        filename = frame.f_code.co_filename
+        if self.is_ignored(filename):
+            return self.trace_fn
+
+        lineno = frame.f_lineno
+        src = linecache.getline(filename, lineno).strip()
+        filename = filename if len(filename) < 30 else '...' + filename[-27:]
+        if event in ('call', 'return'):
+            function = frame.f_code.co_name
+            if event == 'call':
+                args, varargs, kwargs, values = inspect.getargvalues(frame)
+                call_args = tuple(inspect.getargs(frame.f_code))
+                #try:
+                #    if args:
+                #        call_args += ', '.join('{}={!r}'.format(name, values[name]) for name in args)
+                #    if varargs:
+                #        call_args += ', *args={}'.format(varargs)
+                #    if kwargs:
+                #        call_args += ', ' + ', '.join('{}={!r}'.format(k, values[kwargs][k]) for k in values[kwargs])
+                #except:
+                #    pass
+                sys.stderr.write(
+                    self.fmt.format(
+                        msec=(time.time() - self.start), filename=filename, lineno=lineno, indent=self.indent,
+                        src_code='{}{}'.format(function, call_args)
+                    )
+                )
+                self.indent += '  '
+            else:
+                self.indent = self.indent[:-2]
+                if src.find('return') != -1:
+                    sys.stderr.write(
+                        self.fmt.format(
+                            msec=(time.time() - self.start), filename=filename, lineno=lineno, indent=self.indent,
+                            src_code='{} <= {}'.format(function, src)
+                        )
+                    )
+                else:
+                    sys.stderr.write(
+                        self.fmt.format(
+                            msec=(time.time() - self.start), filename=filename, lineno=lineno, indent=self.indent,
+                            src_code='{} <= None'.format(function)
+                        )
+                    )
+#        else:
+#            sys.stderr.write(self.fmt.format(filename=filename, lineno=lineno, indent=self.indent, src_code=src))
+        return self.trace_fn
+
+    def __call__(self, *args, **kwargs):
+        self.start = time.time()
+        @wraps(self.function)
+        def traceit(*args, **kwargs):
+            tracer = sys.gettrace()
+            try:
+                sys.settrace(self.trace_fn)
+                return self.function(*args, **kwargs)
+            finally:
+                sys.settrace(tracer)
+
+        return traceit(*args, **kwargs)
 
 
 class ImprovedConsole(InteractiveConsole, object):
@@ -164,6 +255,7 @@ class ImprovedConsole(InteractiveConsole, object):
             config['LIST_CMD']: self.process_list_cmd,
             config['SH_EXEC']: self.process_sh_cmd,
             config['HELP_CMD']: self.process_help_cmd,
+            config['TRACE_CMD']: self.process_trace_cmd,
         }
         # - regex to identify and extract commands and their arguments
         self.commands_re = re.compile(
@@ -577,10 +669,10 @@ class ImprovedConsole(InteractiveConsole, object):
     def process_list_cmd(self, arg):
         """{LIST_CMD} <object> - List source code for object, if possible.
         """
+        if not arg:
+            return self.writeline('source list command requires an argument '
+                                  '(eg: {} foo)'.format(config['LIST_CMD']))
         try:
-            if not arg:
-                self.writeline('source list command requires an argument '
-                               '(eg: {} foo)\n'.format(config['LIST_CMD']))
             src_lines, offset = inspect.getsourcelines(self.lookup(arg))
         except (IOError, TypeError, NameError) as e:
             self.writeline(e)
@@ -590,6 +682,73 @@ class ImprovedConsole(InteractiveConsole, object):
 
     def process_help_cmd(self, arg=''):
         print(cyan(self.__doc__).format(**config))
+
+    def trace_fn(self, frame, event, arg):
+        """ trace_fn(frame, event, arg) -> trace_fn
+
+        The tracing function that'll be set using the ``sys.settrace()`` call.
+        """
+        filename = frame.f_code.co_filename
+        if self.is_ignored(filename):
+            return self.trace_fn
+
+        lineno = frame.f_lineno
+        src = linecache.getline(filename, lineno).strip()
+        filename = filename if len(filename) < 30 else '...' + filename[-27:]
+        if event in ('call', 'return'):
+            fn = frame.f_code.co_name
+            if event == 'call':
+                args = ''
+                if frame.f_code.co_argcount > 0:
+                    args = ', '.join(
+                        '{} = {!r}'.format(k, v)
+                        for k, v in frame.f_locals.items()
+                    )
+                self.writeline(
+                    "%30s +%-5s |%s%s(%s)" % (
+                        filename, lineno, self.indent, fn, args
+                    ))
+                self.indent += '  '
+            else:
+                self.indent = self.indent[:-2]
+                if src.find('return') != -1:
+                    self.writeline("%30s +%-5s |%s%s <= %s" % (
+                        filename, lineno, self.indent, fn, src.replace('return', '')
+                    ))
+                else:
+                    self.writeline("%30s +%-5s |%s%s() <= None" % (
+                        filename, lineno, self.indent, fn
+                    ))
+        else:
+            self.writeline("%30s +%-5s |%s%s\n" % (
+                filename, lineno, self.indent, src
+            ))
+
+        return self.trace_fn
+
+    def process_trace_cmd(self, arg):
+        """{TRACE_CMD} <function>
+
+        Setup a trace decorator for the function, if possible
+        """
+        if not arg:
+            return self.writeline('trace command requires a argument '
+                                  '(eg: {} foo)'.format(config['TRACE_CMD']))
+
+        to_trace = self.lookup(arg)
+        if not callable(to_trace):
+            return self.writeline('trace command requires a callable argument '
+                                  '(eg: {} foo)'.format(config['TRACE_CMD']))
+
+        if type(to_trace) is types.MethodType:
+            name = to_trace.im_func.func_name
+            namespace = to_trace.im_class
+        elif type(to_trace) is types.FunctionType:
+            namespace, name = arg.split('.', 1)
+            namespace = self.locals[namespace]
+
+        tracer = Tracer(to_trace)
+        setattr(namespace, name, tracer)
 
     def interact(self):
         """A forgiving wrapper around InteractiveConsole.interact()
